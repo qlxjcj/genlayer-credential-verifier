@@ -49,5 +49,5 @@ A later verification can never leave a holder+type simultaneously verified and f
 
 ## Deployment
 
-- Contract: `0xC81Ea35aa44795ceC031a5450B79c0c80c4DbaE2` (Bradbury)
-- Explorer: https://explorer-bradbury.genlayer.com/address/0xC81Ea35aa44795ceC031a5450B79c0c80c4DbaE2
+- Contract: `0x6BCE9be8026f09A054EBA79f97A20730Da6094b1` (Bradbury)
+- Explorer: https://explorer-bradbury.genlayer.com/address/0x6BCE9be8026f09A054EBA79f97A20730Da6094b1

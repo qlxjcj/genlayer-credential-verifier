@@ -7,7 +7,7 @@ from genlayer import *
 @allow_storage
 @dataclass
 class Credential:
-    credential_id: str
+    credential_id: u256
     submitter: str
     holder_name: str
     credential_type: str
@@ -18,11 +18,10 @@ class Credential:
     validity_score: u256
     confidence: u256
     findings: str
-    timestamp: str
 
 
 class CredentialVerifier(gl.Contract):
-    credentials: TreeMap[str, str]
+    credentials: TreeMap[u256, str]
     credential_count: u256
     verified: TreeMap[str, str]
     flagged: TreeMap[str, str]
@@ -34,7 +33,11 @@ class CredentialVerifier(gl.Contract):
         def gather_and_verify() -> dict:
             def fetch(urls_json: str) -> list:
                 texts = []
-                for url in json.loads(urls_json):
+                try:
+                    urls = json.loads(urls_json)
+                except Exception:
+                    urls = [urls_json] if urls_json else []
+                for url in urls:
                     try:
                         content = gl.nondet.web.get(url)
                         texts.append(f"[{url}]\n{content.body.decode('utf-8', errors='replace')[:2500]}")
@@ -45,25 +48,12 @@ class CredentialVerifier(gl.Contract):
             sources = fetch(source_urls)
 
             task = f"""
-You are a credential verification expert. Verify a credential claim against multiple independent authoritative sources.
-
-HOLDER: {holder_name}
-CREDENTIAL TYPE: {credential_type}
-CLAIMED ISSUER: {issuer}
-
+Credential check: holder {holder_name}, type {credential_type}, issuer {issuer}.
 SOURCES:
 {chr(10).join(sources) if sources else "[none submitted]"}
 
-Evaluate: (1) Does the credential exist in authoritative registries? (2) Is the holder name consistent? (3) Is the issuer legitimate? (4) Any forged or inconsistent indicators?
-
-Respond ONLY in this JSON format with exact fields:
-{{
-    "result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS",
-    "validity_score": int,
-    "confidence": int,
-    "findings": [str]
-}}
-It is mandatory that you respond only using the JSON format above, nothing else.
+Decide if this credential appears in an authoritative registry.
+Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "validity_score": int, "confidence": int, "findings": [str]}}
 """
             result = gl.nondet.exec_prompt(task).replace("```json", "").replace("```", "")
             return json.loads(result)
@@ -75,19 +65,18 @@ It is mandatory that you respond only using the JSON format above, nothing else.
     def submit_credential(self, holder_name: str, credential_type: str, issuer: str, source_urls_json: str):
         sender = gl.message.sender_address
         self.credential_count += 1
-        credential_id = str(self.credential_count)
+        credential_id = self.credential_count
 
         credential = Credential(
             credential_id=credential_id, submitter=sender.as_hex,
             holder_name=holder_name, credential_type=credential_type,
             issuer=issuer, source_urls=source_urls_json, status="PENDING",
             result="", validity_score=0, confidence=0, findings="[]",
-            timestamp="",
         )
         self.credentials[credential_id] = json.dumps(credential.__dict__)
 
     @gl.public.write
-    def process_verification(self, credential_id: str):
+    def process_verification(self, credential_id: u256):
         sender = gl.message.sender_address
         credential = json.loads(self.credentials.get(credential_id, "{}"))
         if not credential:
@@ -140,7 +129,7 @@ It is mandatory that you respond only using the JSON format above, nothing else.
             self.flagged.pop(key, None)
 
     @gl.public.view
-    def get_credential(self, credential_id: str) -> str:
+    def get_credential(self, credential_id: u256) -> str:
         return self.credentials.get(credential_id, "{}")
 
     @gl.public.view
@@ -178,7 +167,7 @@ It is mandatory that you respond only using the JSON format above, nothing else.
         result = {}
         for k, v in self.credentials.items():
             c = json.loads(v)
-            result[k] = {
+            result[str(k)] = {
                 "holder": c["holder_name"],
                 "type": c["credential_type"],
                 "issuer": c["issuer"],
