@@ -31,13 +31,13 @@ class CredentialVerifier(gl.Contract):
         pass
 
     def _verify_credential(self, holder_name: str, credential_type: str, issuer: str, source_urls: str) -> dict:
-        def gather_and_verify() -> str:
+        def gather_and_verify() -> dict:
             def fetch(urls_json: str) -> list:
                 texts = []
                 for url in json.loads(urls_json):
                     try:
-                        content = gl.get_webpage(url, mode="text")
-                        texts.append(f"[{url}]\n{content[:2500]}")
+                        content = gl.nondet.web.get(url)
+                        texts.append(f"[{url}]\n{content.body.decode('utf-8', errors='replace')[:2500]}")
                     except Exception:
                         texts.append(f"[{url}] [FETCH_FAILED]")
                 return texts
@@ -58,18 +58,18 @@ Evaluate: (1) Does the credential exist in authoritative registries? (2) Is the 
 
 Respond ONLY in this JSON format with exact fields:
 {{
-    "result": "VERIFIED" | "UNVERIFIED" | "SUSPICIOUS",
-    "validity_score": int,  // 0-100
-    "confidence": int,  // 0-100
+    "result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS",
+    "validity_score": int,
+    "confidence": int,
     "findings": [str]
 }}
+It is mandatory that you respond only using the JSON format above, nothing else.
 """
-            result = gl.exec_prompt(task).replace("```json", "").replace("```", "")
-            return json.dumps(json.loads(result), sort_keys=True)
+            result = gl.nondet.exec_prompt(task).replace("```json", "").replace("```", "")
+            return json.loads(result)
 
-        principle = "Validators must agree on ALL FOUR outputs: the exact result label (VERIFIED/UNVERIFIED/SUSPICIOUS), the exact validity_score (0-100), the exact confidence (0-100), and the set of findings. Reasoning wording may differ."
-        result_json = json.loads(gl.eq_principle_prompt_comparative(gather_and_verify, principle))
-        return result_json
+        principle = "result must be exactly the same (VERIFIED/UNVERIFIED/SUSPICIOUS), validity_score and confidence must be the same integers."
+        return gl.eq_principle.prompt_comparative(gather_and_verify, principle)
 
     @gl.public.write
     def submit_credential(self, holder_name: str, credential_type: str, issuer: str, source_urls_json: str):
@@ -82,7 +82,7 @@ Respond ONLY in this JSON format with exact fields:
             holder_name=holder_name, credential_type=credential_type,
             issuer=issuer, source_urls=source_urls_json, status="PENDING",
             result="", validity_score=0, confidence=0, findings="[]",
-            timestamp=str(gl.message.timestamp),
+            timestamp="",
         )
         self.credentials[credential_id] = json.dumps(credential.__dict__)
 
@@ -126,11 +126,18 @@ Respond ONLY in this JSON format with exact fields:
         credential["findings"] = json.dumps(findings)
         self.credentials[credential_id] = json.dumps(credential)
 
+        # Update public index so that one holder+type maps to exactly ONE
+        # non-conflicting state. Each new verdict clears incompatible prior state.
         key = f"{credential['holder_name']}:{credential['credential_type']}"
         if result_label == "VERIFIED":
             self.verified[key] = json.dumps({"issuer": credential["issuer"], "score": score, "confidence": conf})
+            self.flagged.pop(key, None)
         elif result_label == "SUSPICIOUS":
             self.flagged[key] = json.dumps({"score": score, "findings": findings})
+            self.verified.pop(key, None)
+        else:  # UNVERIFIED — neither verified nor suspicious
+            self.verified.pop(key, None)
+            self.flagged.pop(key, None)
 
     @gl.public.view
     def get_credential(self, credential_id: str) -> str:
