@@ -10,6 +10,7 @@ class Credential:
     credential_id: u256
     submitter: str
     holder_name: str
+    holder_address: str
     credential_type: str
     issuer: str
     source_urls: str
@@ -23,8 +24,8 @@ class Credential:
 class CredentialVerifier(gl.Contract):
     credentials: TreeMap[u256, str]
     credential_count: u256
-    verified: TreeMap[str, str]
-    flagged: TreeMap[str, str]
+    verified: TreeMap[str, str]  # key -> {owner, holder_address, issuer, score, confidence}
+    flagged: TreeMap[str, str]   # key -> {owner, holder_address, score, findings}
 
     def __init__(self):
         pass
@@ -61,15 +62,43 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
         principle = "result must be exactly the same (VERIFIED/UNVERIFIED/SUSPICIOUS), validity_score and confidence must be the same integers."
         return gl.eq_principle.prompt_comparative(gather_and_verify, principle)
 
+    # Authority policy: the index key for a holder's credential is OWNED by the
+    # holder's wallet address. Only the owner (the account that first claims the
+    # holder:type pair) may update or clear the public index entry for that pair.
+    def _index_key(self, holder_address: str, credential_type: str) -> str:
+        return f"{holder_address}:{credential_type}"
+
+    def _claim_owner(self, key: str) -> str:
+        # Returns the owner address bound to this index key, or "" if free.
+        cur = self.verified.get(key, "")
+        if cur:
+            try:
+                return json.loads(cur).get("owner", "")
+            except Exception:
+                return ""
+        cur = self.flagged.get(key, "")
+        if cur:
+            try:
+                return json.loads(cur).get("owner", "")
+            except Exception:
+                return ""
+        return ""
+
+    def _check_index_authority(self, key: str, sender_hex: str):
+        owner = self._claim_owner(key)
+        if owner and owner != sender_hex:
+            raise Exception("Index key owned by another holder; replacement not permitted")
+
     @gl.public.write
-    def submit_credential(self, holder_name: str, credential_type: str, issuer: str, source_urls_json: str):
+    def submit_credential(self, holder_name: str, holder_address: str, credential_type: str, issuer: str, source_urls_json: str):
         sender = gl.message.sender_address
         self.credential_count += 1
         credential_id = self.credential_count
 
         credential = Credential(
             credential_id=credential_id, submitter=sender.as_hex,
-            holder_name=holder_name, credential_type=credential_type,
+            holder_name=holder_name, holder_address=holder_address,
+            credential_type=credential_type,
             issuer=issuer, source_urls=source_urls_json, status="PENDING",
             result="", validity_score=0, confidence=0, findings="[]",
         )
@@ -115,16 +144,25 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
         credential["findings"] = json.dumps(findings)
         self.credentials[credential_id] = json.dumps(credential)
 
-        # Update public index so that one holder+type maps to exactly ONE
-        # non-conflicting state. Each new verdict clears incompatible prior state.
-        key = f"{credential['holder_name']}:{credential['credential_type']}"
+        # Authority + replacement policy:
+        # The public index for a holder:type pair is owned by the holder's
+        # wallet address. A different account cannot overwrite or clear the
+        # owner's shared status; only the owner can replace their own entry.
+        key = self._index_key(credential["holder_address"], credential["credential_type"])
+        self._check_index_authority(key, sender.as_hex)
+
+        owner_entry = {
+            "owner": sender.as_hex,
+            "holder_address": credential["holder_address"],
+            "issuer": credential["issuer"],
+        }
         if result_label == "VERIFIED":
-            self.verified[key] = json.dumps({"issuer": credential["issuer"], "score": score, "confidence": conf})
+            self.verified[key] = json.dumps({**owner_entry, "score": score, "confidence": conf})
             self.flagged.pop(key, None)
         elif result_label == "SUSPICIOUS":
-            self.flagged[key] = json.dumps({"score": score, "findings": findings})
+            self.flagged[key] = json.dumps({**owner_entry, "score": score, "findings": findings})
             self.verified.pop(key, None)
-        else:  # UNVERIFIED — neither verified nor suspicious
+        else:  # UNVERIFIED — owner may clear their own index state
             self.verified.pop(key, None)
             self.flagged.pop(key, None)
 
@@ -133,12 +171,12 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
         return self.credentials.get(credential_id, "{}")
 
     @gl.public.view
-    def is_verified(self, holder_name: str, credential_type: str) -> str:
-        return self.verified.get(f"{holder_name}:{credential_type}", "{}")
+    def is_verified(self, holder_address: str, credential_type: str) -> str:
+        return self.verified.get(self._index_key(holder_address, credential_type), "{}")
 
     @gl.public.view
-    def is_flagged(self, holder_name: str, credential_type: str) -> str:
-        return self.flagged.get(f"{holder_name}:{credential_type}", "{}")
+    def is_flagged(self, holder_address: str, credential_type: str) -> str:
+        return self.flagged.get(self._index_key(holder_address, credential_type), "{}")
 
     @gl.public.view
     def get_credential_count(self) -> int:
@@ -169,6 +207,7 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
             c = json.loads(v)
             result[str(k)] = {
                 "holder": c["holder_name"],
+                "holder_address": c["holder_address"],
                 "type": c["credential_type"],
                 "issuer": c["issuer"],
                 "status": c["status"],
