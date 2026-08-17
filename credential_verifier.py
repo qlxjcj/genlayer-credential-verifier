@@ -26,6 +26,7 @@ class CredentialVerifier(gl.Contract):
     credential_count: u256
     verified: TreeMap[str, str]  # key -> {owner, holder_address, issuer, score, confidence}
     flagged: TreeMap[str, str]   # key -> {owner, holder_address, score, findings}
+    owners: TreeMap[str, str]    # key -> owner address; persists independent of any verdict
 
     def __init__(self):
         pass
@@ -62,41 +63,48 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
         principle = "result must be exactly the same (VERIFIED/UNVERIFIED/SUSPICIOUS), validity_score and confidence must be the same integers."
         return gl.eq_principle.prompt_comparative(gather_and_verify, principle)
 
-    # Authority policy: the index key for a holder's credential is OWNED by the
-    # holder's wallet address. Only the owner (the account that first claims the
-    # holder:type pair) may update or clear the public index entry for that pair.
+    # Authority policy: the public index key for a holder's credential is
+    # BOUND to the holder's wallet address at submission time. The caller must
+    # BE the holder (sender == holder_address); a caller cannot submit an
+    # arbitrary holder address and become that key's owner. Ownership lives in
+    # its own `owners` map and is persisted independently of any verdict, so an
+    # UNVERIFIED result clears the public entries but never releases the key.
     def _index_key(self, holder_address: str, credential_type: str) -> str:
-        return f"{holder_address}:{credential_type}"
+        return f"{self._addr_hex(holder_address)}:{credential_type}"
+
+    def _addr_hex(self, a) -> str:
+        # Address objects (from calldata ADDR encoding or sender) -> hex string.
+        if hasattr(a, "as_hex"):
+            return a.as_hex
+        return str(a)
 
     def _claim_owner(self, key: str) -> str:
-        # Returns the owner address bound to this index key, or "" if free.
-        cur = self.verified.get(key, "")
-        if cur:
-            try:
-                return json.loads(cur).get("owner", "")
-            except Exception:
-                return ""
-        cur = self.flagged.get(key, "")
-        if cur:
-            try:
-                return json.loads(cur).get("owner", "")
-            except Exception:
-                return ""
-        return ""
+        return self.owners.get(key, "")
 
-    def _check_index_authority(self, key: str, sender_hex: str):
+    def _check_index_authority(self, key: str, holder_address: str):
         owner = self._claim_owner(key)
-        if owner and owner != sender_hex:
+        if owner and owner.lower() != self._addr_hex(holder_address).lower():
             raise Exception("Index key owned by another holder; replacement not permitted")
 
     @gl.public.write
     def submit_credential(self, holder_name: str, holder_address: str, credential_type: str, issuer: str, source_urls_json: str):
-        sender = gl.message.sender_address
+        sender = gl.message.sender_address.as_hex
+        holder_address = self._addr_hex(holder_address)
+        # The caller must be the holder themself. Binding the holder address to
+        # the caller prevents anyone from claiming another party's key.
+        if sender.lower() != holder_address.lower():
+            raise Exception("Only the holder can submit their own credential")
+
+        key = self._index_key(holder_address, credential_type)
+        self._check_index_authority(key, holder_address)
+        if not self._claim_owner(key):
+            self.owners[key] = holder_address
+
         self.credential_count += 1
         credential_id = self.credential_count
 
         credential = Credential(
-            credential_id=credential_id, submitter=sender.as_hex,
+            credential_id=credential_id, submitter=sender,
             holder_name=holder_name, holder_address=holder_address,
             credential_type=credential_type,
             issuer=issuer, source_urls=source_urls_json, status="PENDING",
@@ -145,14 +153,17 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
         self.credentials[credential_id] = json.dumps(credential)
 
         # Authority + replacement policy:
-        # The public index for a holder:type pair is owned by the holder's
-        # wallet address. A different account cannot overwrite or clear the
-        # owner's shared status; only the owner can replace their own entry.
+        # The key is bound to the holder's wallet address. Ownership is stored
+        # in its own `owners` map and persists independently of the verdict:
+        # UNVERIFIED clears the public entries but never releases the key, so
+        # another account cannot later re-claim the holder's pair.
         key = self._index_key(credential["holder_address"], credential["credential_type"])
-        self._check_index_authority(key, sender.as_hex)
+        self._check_index_authority(key, credential["holder_address"])
+        if not self._claim_owner(key):
+            self.owners[key] = credential["holder_address"]
 
         owner_entry = {
-            "owner": sender.as_hex,
+            "owner": credential["holder_address"],
             "holder_address": credential["holder_address"],
             "issuer": credential["issuer"],
         }
@@ -162,7 +173,7 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
         elif result_label == "SUSPICIOUS":
             self.flagged[key] = json.dumps({**owner_entry, "score": score, "findings": findings})
             self.verified.pop(key, None)
-        else:  # UNVERIFIED — owner may clear their own index state
+        else:  # UNVERIFIED — clears public entries, ownership record persists
             self.verified.pop(key, None)
             self.flagged.pop(key, None)
 
@@ -177,6 +188,12 @@ Respond ONLY JSON: {{"result": "VERIFIED" or "UNVERIFIED" or "SUSPICIOUS", "vali
     @gl.public.view
     def is_flagged(self, holder_address: str, credential_type: str) -> str:
         return self.flagged.get(self._index_key(holder_address, credential_type), "{}")
+
+    @gl.public.view
+    def get_owner(self, holder_address: str, credential_type: str) -> str:
+        # Ownership is independent of the current verdict; it persists across
+        # VERIFIED / SUSPICIOUS / UNVERIFIED transitions.
+        return self.owners.get(self._index_key(holder_address, credential_type), "")
 
     @gl.public.view
     def get_credential_count(self) -> int:
